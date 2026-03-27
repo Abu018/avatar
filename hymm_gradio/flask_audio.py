@@ -4,6 +4,7 @@ import torch
 import warnings
 import threading
 import traceback
+import uuid
 import uvicorn
 from fastapi import FastAPI, Body
 from pathlib import Path
@@ -21,13 +22,105 @@ from hymm_sp.modules.parallel_states import (
 from transformers import WhisperModel
 from transformers import AutoFeatureExtractor
 from hymm_sp.data_kits.face_align import AlignImage
+from hymm_gradio.tts_service import synthesize_to_wav
+from hymm_gradio.wav2lip_service import run_wav2lip
 
 
 warnings.filterwarnings("ignore")
 MODEL_OUTPUT_PATH = os.environ.get('MODEL_BASE')
+AVATAR_STORE_DIR = os.environ.get("AVATAR_STORE_DIR", "./assets/avatars")
 app = FastAPI()
 rlock = threading.RLock()
 
+
+def _ensure_avatar_store():
+    os.makedirs(AVATAR_STORE_DIR, exist_ok=True)
+
+
+def _avatar_path(avatar_id):
+    return os.path.join(AVATAR_STORE_DIR, f"{avatar_id}.mp4")
+
+
+def save_avatar_video_from_base64(video_base64, avatar_id=None):
+    _ensure_avatar_store()
+    final_avatar_id = avatar_id or str(uuid.uuid4())
+    output_path = _avatar_path(final_avatar_id)
+    save_video_base64_to_local(video_path=None, base64_buffer=video_base64, output_video_path=output_path)
+    return final_avatar_id, output_path
+
+
+def get_avatar_video_path(avatar_id):
+    if not avatar_id:
+        return None
+    path = _avatar_path(avatar_id)
+    return path if os.path.exists(path) else None
+
+
+@app.get('/avatars/list')
+def list_avatars():
+    try:
+        _ensure_avatar_store()
+        avatars = []
+        for name in sorted(os.listdir(AVATAR_STORE_DIR)):
+            if not name.endswith(".mp4"):
+                continue
+            avatar_id = name[:-4]
+            avatar_path = os.path.join(AVATAR_STORE_DIR, name)
+            avatars.append({"avatar_id": avatar_id, "avatar_path": avatar_path})
+        return {"errCode": 0, "avatars": avatars, "info": "succeed"}
+    except Exception:
+        traceback.print_exc()
+        return {"errCode": -1, "avatars": [], "info": "failed to list avatars"}
+
+
+def run_tts(text, voice_id=None, language=None, speed=1.0, provider=None):
+    return synthesize_to_wav(
+        text=text,
+        voice_id=voice_id or "aura-2-thalia-en",
+        language=language,
+        speed=speed,
+        provider=provider or "deepgram",
+    )
+
+
+@app.post('/tts')
+def tts(data=Body(...)):
+    """
+    TTS endpoint scaffold.
+    Expected payload:
+    {
+      "text_input": "hello world",
+      "voice_id": "optional",
+      "language": "optional",
+      "speed": 1.0,
+      "provider": "optional"
+    }
+    """
+    try:
+        text = data.get("text_input", None)
+        if text is None:
+            text = data.get("text", None)
+        if not text:
+            return {"errCode": -3, "audio_path": None, "info": "text_input is required"}
+
+        voice_id = data.get("voice_id", None)
+        language = data.get("language", None)
+        speed = data.get("speed", 1.0)
+        provider = data.get("provider", None)
+
+        audio_path = run_tts(
+            text=text,
+            voice_id=voice_id,
+            language=language,
+            speed=speed,
+            provider=provider,
+        )
+        return {"errCode": 0, "audio_path": audio_path, "info": "succeed"}
+    except NotImplementedError as e:
+        return {"errCode": -4, "audio_path": None, "info": str(e)}
+    except Exception:
+        traceback.print_exc()
+        return {"errCode": -1, "audio_path": None, "info": "failed to generate audio"}
 
 
 @app.api_route('/predict2', methods=['GET', 'POST'])
@@ -47,7 +140,54 @@ def predict(data=Body(...)):
             rlock.release()
     return {"errCode": -1, "info": "broken"}
 
+@app.post('/wav2lip')
+def wav2lip_api(data=Body(...)):
+    try:
+        decoded = process_input_dict(data)
+        base_video_path = decoded.get("base_video_path", None)
+        audio_path = decoded.get("audio_path", None)
+        avatar_id = data.get("avatar_id", None)
+        if base_video_path is None and avatar_id is not None:
+            base_video_path = get_avatar_video_path(avatar_id)
+
+        text_input = data.get("text_input", None) or data.get("tts_text", None)
+        if audio_path is None and text_input:
+            audio_path = run_tts(
+                text=text_input,
+                voice_id=data.get("voice_id", None),
+                language=data.get("language", None),
+                speed=data.get("speed", 1.0),
+                provider=data.get("provider", "deepgram"),
+            )
+
+        if base_video_path is None or audio_path is None:
+            return {
+                "errCode": -3,
+                "content": [{"buffer": None}],
+                "info": "base_video_buffer/video_buffer and audio_buffer or text_input are required",
+            }
+
+        output_path = run_wav2lip(
+            face_video_path=base_video_path,
+            audio_path=audio_path,
+            checkpoint_path=data.get("wav2lip_checkpoint", None),
+            wav2lip_repo=data.get("wav2lip_repo", None),
+        )
+        video_b64 = encode_video_to_base64(output_path)
+        return {
+            "errCode": 0,
+            "content": [{"buffer": video_b64}],
+            "info": "succeed",
+            "avatar_id": avatar_id,
+            "avatar_path": base_video_path,
+        }
+    except Exception:
+        traceback.print_exc()
+        return {"errCode": -1, "content": [{"buffer": None}], "info": "failed to run wav2lip"}
+
+
 def predict_wrap(input_dict={}):
+    rank = local_rank = 0
     if nccl_info.sp_size > 1:
         device = torch.device(f"cuda:{torch.distributed.get_rank()}")
         rank = local_rank = torch.distributed.get_rank()
@@ -55,19 +195,40 @@ def predict_wrap(input_dict={}):
     try:
         print(f"----- rank = {rank}")
         if rank == 0:
+            raw_input = dict(input_dict)
             input_dict = process_input_dict(input_dict)
 
             print('------- start to predict -------')
             # Parse input arguments
             image_path = input_dict["image_path"]
             driving_audio_path = input_dict["audio_path"]
+            text_input = raw_input.get("text_input", None) or raw_input.get("tts_text", None)
 
             prompt = input_dict["prompt"]
 
             save_fps = input_dict.get("save_fps", 25)
+            tts_generated_audio_path = None
 
 
             ret_dict = None
+            if driving_audio_path is None and text_input:
+                try:
+                    tts_generated_audio_path = run_tts(
+                        text=text_input,
+                        voice_id=raw_input.get("voice_id", None),
+                        language=raw_input.get("language", None),
+                        speed=raw_input.get("speed", 1.0),
+                        provider=raw_input.get("provider", "deepgram"),
+                    )
+                    driving_audio_path = tts_generated_audio_path
+                except Exception as e:
+                    print(f"TTS generation failed: {e}")
+                    return {
+                        "errCode": -5,
+                        "content": [{"buffer": None}],
+                        "info": f"failed to generate tts audio: {e}",
+                    }
+
             if image_path is None or driving_audio_path is None:
                 ret_dict = {
                     "errCode": -3, 
@@ -179,11 +340,22 @@ def predict_wrap(input_dict={}):
                 "err_code": 0, 
                 "err_msg": "succeed", 
                 "video": video, 
-                "audio": input_dict.get("audio_path", None), 
+                "audio": tts_generated_audio_path or input_dict.get("audio_path", None),
                 "save_fps": save_fps, 
             }
 
             ret_dict = process_output_dict(output_dict)
+            try:
+                avatar_id = raw_input.get("avatar_id", None)
+                avatar_video_b64 = ret_dict["content"][0]["buffer"]
+                saved_avatar_id, saved_avatar_path = save_avatar_video_from_base64(
+                    avatar_video_b64,
+                    avatar_id=avatar_id,
+                )
+                ret_dict["avatar_id"] = saved_avatar_id
+                ret_dict["avatar_path"] = saved_avatar_path
+            except Exception as e:
+                print(f"Warning: failed to persist avatar video: {e}")
             return ret_dict
     
     except:

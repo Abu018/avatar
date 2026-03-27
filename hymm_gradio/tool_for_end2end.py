@@ -318,6 +318,17 @@ def process_input_dict(input_dict):
             base64_buffer=audio_base64_buffer)
     else:
         decoded_input_dict["audio_path"] = None
+
+    base_video_buffer = input_dict.get("base_video_buffer", None)
+    if base_video_buffer is None:
+        base_video_buffer = input_dict.get("video_buffer", None)
+    if base_video_buffer is not None:
+        decoded_input_dict["base_video_path"] = save_video_base64_to_local(
+            video_path=None,
+            base64_buffer=base_video_buffer,
+        )
+    else:
+        decoded_input_dict["base_video_path"] = None
     
     decoded_input_dict["prompt"] = input_dict.get("text", None)
         
